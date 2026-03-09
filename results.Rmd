@@ -1,0 +1,333 @@
+---
+title: "Lithium Battery Materials: Band Gap Prediction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(42)
+```
+
+## Libraries
+
+```{r libraries}
+library(tidyverse)
+library(MASS)         # stepAIC (load before dplyr to avoid select conflict)
+library(rpart)
+library(rpart.plot)
+library(tidymodels)   # parsnip, dials, tune, rsample, workflows
+library(ranger)       # RF engine for tidymodels
+library(xgboost)      # XGBoost engine for tidymodels
+library(pROC)         # AUC-ROC
+```
+
+## Data Loading & Preprocessing
+
+Note: run `augment_columns.py` in the `chem-calorine` conda environment first to generate
+`lithium_battery_materials_augmented.csv`.
+
+```{r load}
+df <- read_csv("lithium_battery_materials_augmented.csv")
+
+drop_cols <- c("material_id", "formula_pretty", "elements", "band_gap")
+
+df_clean <- df %>%
+  dplyr::select(-all_of(drop_cols)) %>%
+  mutate(
+    is_semiconductor          = factor(is_semiconductor, levels = c(FALSE, TRUE),
+                                       labels = c("No", "Yes")),
+    contains_transition_metal = as.integer(contains_transition_metal)
+  ) %>%
+  drop_na() %>%
+  rename_with(make.names)   # "MagpieData mean X" -> "MagpieData.mean.X"
+
+cat("Dimensions:", nrow(df_clean), "x", ncol(df_clean), "\n")
+table(df_clean$is_semiconductor)
+```
+
+## 80 / 10 / 10 Train / Val / Test Split
+
+```{r split}
+n         <- nrow(df_clean)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+remaining <- setdiff(seq_len(n), train_idx)
+val_idx   <- sample(remaining, size = floor(0.5 * length(remaining)))
+test_idx  <- setdiff(remaining, val_idx)
+
+train <- df_clean[train_idx, ]
+val   <- df_clean[val_idx,   ]
+test  <- df_clean[test_idx,  ]
+
+train_val <- rbind(train, val)   # used by RF (tidymodels) and XGBoost (caret)
+
+y_val  <- val$is_semiconductor
+y_test <- test$is_semiconductor
+
+cat(sprintf("Train: %d | Val: %d | Test: %d\n", nrow(train), nrow(val), nrow(test)))
+```
+
+## Helper: Evaluation Metrics
+
+```{r eval_fn}
+evaluate <- function(actual, predicted_class, predicted_prob, label = "") {
+  if (nchar(label) > 0) cat(label, "\n")
+  acc     <- mean(predicted_class == actual)
+  roc_obj <- roc(actual, predicted_prob, levels = c("No", "Yes"), quiet = TRUE)
+  auc_val <- as.numeric(auc(roc_obj))
+  cat(sprintf("  Accuracy : %.4f\n", acc))
+  cat(sprintf("  AUC-ROC  : %.4f\n", auc_val))
+  print(table(Predicted = predicted_class, Actual = actual))
+  invisible(list(acc = acc, auc = auc_val, roc = roc_obj))
+}
+```
+
+---
+
+## 1. Logistic Regression
+
+Train a **full model** and a **stepwise-selected model** (bidirectional AIC) on the training
+set, compare on the validation set, then report test metrics for the winner.
+
+```{r logistic_train}
+make_lr_df <- function(df) {
+  df %>%
+    mutate(y = as.integer(is_semiconductor == "Yes")) %>%
+    dplyr::select(-is_semiconductor)
+}
+lr_train <- make_lr_df(train)
+lr_val   <- make_lr_df(val)
+lr_test  <- make_lr_df(test)
+
+lr_full <- glm(y ~ ., data = lr_train, family = binomial())
+lr_step <- MASS::stepAIC(lr_full, direction = "both", trace = FALSE)
+
+cat("Full model — features    :", length(coef(lr_full)) - 1, "\n")
+cat("Stepwise model — features:", length(coef(lr_step)) - 1, "\n")
+cat("Stepwise retained:\n")
+print(names(coef(lr_step))[-1])
+```
+
+```{r logistic_val}
+to_class <- function(prob) factor(ifelse(prob > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+full_prob_val <- predict(lr_full, newdata = lr_val, type = "response")
+step_prob_val <- predict(lr_step, newdata = lr_val, type = "response")
+
+full_val_res <- evaluate(y_val, to_class(full_prob_val), full_prob_val, "Full LR (val)")
+step_val_res <- evaluate(y_val, to_class(step_prob_val), step_prob_val, "Stepwise LR (val)")
+
+lr_best      <- if (full_val_res$auc >= step_val_res$auc) lr_full else lr_step
+lr_best_name <- if (full_val_res$auc >= step_val_res$auc) "Full LR" else "Stepwise LR"
+cat("Selected:", lr_best_name, "\n")
+```
+
+```{r logistic_test}
+lr_prob_test <- predict(lr_best, newdata = lr_test, type = "response")
+lr_res <- evaluate(y_test, to_class(lr_prob_test), lr_prob_test,
+                   paste(lr_best_name, "(test)"))
+```
+
+---
+
+## 2. Decision Tree
+
+Pruned using rpart's internal 10-fold CV with the **1-SE rule**: pick the simplest tree
+whose `xerror` is within one standard error of the minimum. The validation set is used
+for evaluation only (consistent with the other models).
+
+```{r decision_tree}
+dt_model <- rpart(
+  is_semiconductor ~ .,
+  data    = train,
+  method  = "class",
+  control = rpart.control(cp = 1e-4, xval = 10)
+)
+
+# 1-SE rule
+cp_tbl    <- dt_model$cptable
+min_row   <- which.min(cp_tbl[, "xerror"])
+threshold <- cp_tbl[min_row, "xerror"] + cp_tbl[min_row, "xstd"]
+best_cp   <- cp_tbl[max(which(cp_tbl[, "xerror"] <= threshold)), "CP"]
+dt_pruned <- prune(dt_model, cp = best_cp)
+
+rpart.plot(dt_pruned, type = 4, extra = 104, main = "Decision Tree (1-SE pruned)")
+
+dt_prob_val   <- predict(dt_pruned, newdata = val,  type = "prob")[, "Yes"]
+dt_class_val  <- predict(dt_pruned, newdata = val,  type = "class")
+dt_prob_test  <- predict(dt_pruned, newdata = test, type = "prob")[, "Yes"]
+dt_class_test <- predict(dt_pruned, newdata = test, type = "class")
+
+evaluate(y_val,  dt_class_val,  dt_prob_val,  "Decision Tree (val)")
+dt_res <- evaluate(y_test, dt_class_test, dt_prob_test, "Decision Tree (test)")
+```
+
+---
+
+## 3. Random Forest (tidymodels + Bayesian optimisation)
+
+Tune `mtry` (1-10), `min_n` (1-100), and `max.depth` (3-50) using Bayesian optimisation
+against the explicit validation set (no CV). `tune_bayes()` starts with 5 random
+configurations then runs 10 further iterations guided by a Gaussian process surrogate,
+for 15 total evaluations.
+
+```{r random_forest}
+# Build a single-split resample representing our explicit val set
+val_split <- rsample::make_splits(
+  list(analysis   = seq_len(nrow(train)),
+       assessment = seq_len(nrow(val)) + nrow(train)),
+  data = train_val
+)
+val_rset <- rsample::manual_rset(list(val_split), ids = "Validation")
+
+rf_rec  <- recipe(is_semiconductor ~ ., data = train_val)
+
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 500
+) %>%
+  set_engine("ranger", max.depth = tune(), importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_recipe(rf_rec) %>%
+  add_model(rf_spec)
+
+# Define parameter ranges; max.depth has no built-in dials entry so supply one
+max_depth_param <- new_quant_param(
+  type      = "integer",
+  range     = c(3L, 50L),
+  label     = c(max.depth = "Max Tree Depth"),
+  inclusive = c(TRUE, TRUE)
+)
+
+rf_params <- rf_wf %>%
+  extract_parameter_set_dials() %>%
+  update(
+    mtry      = mtry(range  = c(1L, 10L)),
+    min_n     = min_n(range = c(1L, 100L)),
+    max.depth = max_depth_param
+  )
+
+rf_bayes <- tune_bayes(
+  rf_wf,
+  resamples  = val_rset,
+  param_info = rf_params,
+  iter       = 10,          # 5 initial + 10 BO = 15 total
+  initial    = 5,
+  metrics    = metric_set(roc_auc),
+  control    = control_bayes(verbose = TRUE, no_improve = 10)
+)
+
+autoplot(rf_bayes, type = "performance") +
+  ggtitle("RF Bayesian Optimisation: AUC-ROC per Iteration")
+
+cat("Best RF hyperparameters:\n")
+print(select_best(rf_bayes, metric = "roc_auc"))
+```
+
+```{r rf_test}
+rf_best_params <- select_best(rf_bayes, metric = "roc_auc")
+rf_final_wf    <- finalize_workflow(rf_wf, rf_best_params)
+rf_final_fit   <- fit(rf_final_wf, data = train_val)
+
+rf_prob_test  <- predict(rf_final_fit, new_data = test, type = "prob")$.pred_Yes
+rf_class_test <- predict(rf_final_fit, new_data = test)$.pred_class
+rf_res <- evaluate(y_test, rf_class_test, rf_prob_test, "Random Forest (test)")
+
+# Variable importance from the fitted ranger model
+rf_imp <- rf_final_fit %>%
+  extract_fit_engine() %>%
+  `[[`("variable.importance")
+rf_imp <- sort(rf_imp, decreasing = TRUE)
+barplot(rf_imp[1:10], las = 2, main = "RF Variable Importance (top 10)", cex.names = 0.7)
+
+# Save a train-only model (no val data) for downstream regression scripts.
+# Best hyperparameters are still those found via val-set Bayesian optimisation.
+rf_train_only_fit <- fit(rf_final_wf, data = train)
+saveRDS(rf_train_only_fit, "rf_classifier.rds")
+cat("Saved rf_classifier.rds\n")
+cat("Load in another script with:\n")
+cat("  rf_model <- readRDS('rf_classifier.rds')\n")
+cat("  predict(rf_model, new_data = df, type = 'prob')$.pred_Yes\n")
+cat("  predict(rf_model, new_data = df)$.pred_class\n")
+```
+
+---
+
+## 4. Gradient Boosted Trees (tidymodels + Bayesian optimisation)
+
+Tune `trees` (100-500), `tree_depth` (3-10), and `learn_rate` (0.01-0.32); other
+parameters fixed at sensible defaults. Reuses `val_rset` from section 3.
+
+```{r xgboost}
+xgb_spec <- boost_tree(
+  trees      = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost",
+             colsample_bytree = 1,
+             verbosity        = 0) %>%
+  set_mode("classification")
+
+xgb_wf <- workflow() %>%
+  add_recipe(recipe(is_semiconductor ~ ., data = train_val)) %>%
+  add_model(xgb_spec)
+
+xgb_params <- xgb_wf %>%
+  extract_parameter_set_dials() %>%
+  update(
+    trees      = trees(range      = c(100L, 5000L)),
+    tree_depth = tree_depth(range = c(3L, 50L)),
+    learn_rate = learn_rate(range = c(-2, log10(0.32)))  # 0.01–0.32, log10 scale
+  )
+
+xgb_bayes <- tune_bayes(
+  xgb_wf,
+  resamples  = val_rset,   # same single-split rset as RF
+  param_info = xgb_params,
+  iter       = 10,         # 5 initial + 10 BO = 15 total
+  initial    = 5,
+  metrics    = metric_set(roc_auc),
+  control    = control_bayes(verbose = TRUE, no_improve = 10)
+)
+
+autoplot(xgb_bayes, type = "performance") +
+  ggtitle("XGBoost Bayesian Optimisation: AUC-ROC per Iteration")
+
+cat("Best XGBoost hyperparameters:\n")
+print(select_best(xgb_bayes, metric = "roc_auc"))
+```
+
+```{r xgb_test}
+xgb_best_params <- select_best(xgb_bayes, metric = "roc_auc")
+xgb_final_wf    <- finalize_workflow(xgb_wf, xgb_best_params)
+xgb_final_fit   <- fit(xgb_final_wf, data = train_val)
+
+xgb_prob_test  <- predict(xgb_final_fit, new_data = test, type = "prob")$.pred_Yes
+xgb_class_test <- predict(xgb_final_fit, new_data = test)$.pred_class
+xgb_res <- evaluate(y_test, xgb_class_test, xgb_prob_test, "XGBoost (test)")
+```
+
+---
+
+## Final Model Comparison (Test Set)
+
+```{r comparison}
+results <- tibble(
+  Model    = c(lr_best_name, "Decision Tree", "Random Forest", "XGBoost"),
+  Accuracy = c(lr_res$acc,   dt_res$acc,      rf_res$acc,      xgb_res$acc),
+  AUC_ROC  = c(lr_res$auc,   dt_res$auc,      rf_res$auc,      xgb_res$auc)
+)
+print(results %>% arrange(desc(AUC_ROC)))
+
+plot(lr_res$roc,  col = "blue",   main = "ROC Curves (Test Set)", lwd = 2)
+plot(dt_res$roc,  col = "orange", add = TRUE, lwd = 2)
+plot(rf_res$roc,  col = "green",  add = TRUE, lwd = 2)
+plot(xgb_res$roc, col = "red",    add = TRUE, lwd = 2)
+legend("bottomright",
+  legend = c(lr_best_name, "Decision Tree", "Random Forest", "XGBoost"),
+  col    = c("blue", "orange", "green", "red"),
+  lwd    = 2)
+```
