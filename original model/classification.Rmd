@@ -29,7 +29,7 @@ Note: run `augment_columns.py` in the `chem-calorine` conda environment first to
 ```{r load}
 df <- read_csv("lithium_battery_materials_augmented.csv")
 
-drop_cols <- c("material_id", "formula_pretty", "elements", "band_gap")
+drop_cols <- c("material_id", "formula_pretty", "elements", "band_gap", "volume")
 
 df_clean <- df %>%
   dplyr::select(-all_of(drop_cols)) %>%
@@ -96,6 +96,7 @@ make_lr_df <- function(df) {
 }
 lr_train <- make_lr_df(train)
 lr_val   <- make_lr_df(val)
+lr_train_val <- make_lr_df(train_val) #combo of training and test
 lr_test  <- make_lr_df(test)
 
 lr_full <- glm(y ~ ., data = lr_train, family = binomial())
@@ -122,10 +123,15 @@ cat("Selected:", lr_best_name, "\n")
 ```
 
 ```{r logistic_test}
-# NOTE: not retraining on validation and test here
-lr_prob_test <- predict(lr_best, newdata = lr_test, type = "response")
+# retraining on validation and test here 
+lr_best_final <- glm(formula(lr_best), data = lr_train_val, family = binomial())
+
+lr_prob_test <- predict(lr_best_final, newdata = lr_test, type = "response")
 lr_res <- evaluate(y_test, to_class(lr_prob_test), lr_prob_test,
                    paste(lr_best_name, "(test)"))
+#output the model coefficients for the best logistic regression model
+cat("Coefficients for", lr_best_name, ":\n")
+print(coef(lr_best))
 ```
 
 ---
@@ -149,7 +155,8 @@ cp_tbl    <- dt_model$cptable
 min_row   <- which.min(cp_tbl[, "xerror"])
 threshold <- cp_tbl[min_row, "xerror"] + cp_tbl[min_row, "xstd"]
 best_cp   <- cp_tbl[max(which(cp_tbl[, "xerror"] <= threshold)), "CP"]
-dt_pruned <- prune(dt_model, cp = best_cp)
+#dt_pruned <- prune(dt_model, cp = best_cp)
+dt_pruned <- rpart::prune.rpart(dt_model, cp = best_cp)
 
 rpart.plot(dt_pruned, type = 4, extra = 104, main = "Decision Tree (1-SE pruned)")
 
@@ -160,8 +167,18 @@ dt_class_test <- predict(dt_pruned, newdata = test, type = "class")
 
 evaluate(y_val,  dt_class_val,  dt_prob_val,  "Decision Tree (val)")
 dt_res <- evaluate(y_test, dt_class_test, dt_prob_test, "Decision Tree (test)")
+
 ```
 
+
+```{r decision_tree_importance}
+#get variable importance from the fitted rpart model
+dt_imp <- dt_pruned$variable.importance
+dt_imp <- sort(dt_imp, decreasing = TRUE)
+par(mar = c(10, 4, 4, 2))
+barplot(dt_imp[1:10], las = 2, main = "Decision Tree Variable Importance (top 10)", cex.names = 0.7)
+par(mar = c(5, 4, 4, 2))
+```
 ---
 
 ## 3. Random Forest (tidymodels + Bayesian optimisation)
@@ -187,7 +204,7 @@ rf_rec  <- recipe(is_semiconductor ~ ., data = train_val)
 rf_spec <- rand_forest(
   mtry  = tune(),
   min_n = tune(),
-  trees = 500
+  trees = tune(),#500
 ) %>%
   set_engine("ranger", max.depth = tune(), importance = "impurity") %>%
   set_mode("classification")
@@ -217,7 +234,7 @@ rf_bayes <- tune_bayes(
   resamples  = val_rset,
   param_info = rf_params,
   iter       = 10,          # 5 initial + 10 BO = 15 total
-  initial    = 5,
+  initial    = 15,
   metrics    = metric_set(roc_auc),
   control    = control_bayes(verbose = TRUE, no_improve = 10)
 )
@@ -238,13 +255,6 @@ rf_prob_test  <- predict(rf_final_fit, new_data = test, type = "prob")$.pred_Yes
 rf_class_test <- predict(rf_final_fit, new_data = test)$.pred_class
 rf_res <- evaluate(y_test, rf_class_test, rf_prob_test, "Random Forest (test)")
 
-# Variable importance from the fitted ranger model
-rf_imp <- rf_final_fit %>%
-  extract_fit_engine() %>%
-  `[[`("variable.importance")
-rf_imp <- sort(rf_imp, decreasing = TRUE)
-barplot(rf_imp[1:10], las = 2, main = "RF Variable Importance (top 10)", cex.names = 0.7)
-
 # Save a train-only model (no val data) for downstream regression scripts.
 # Best hyperparameters are still those found via val-set Bayesian optimisation.
 rf_train_only_fit <- fit(rf_final_wf, data = train)
@@ -254,6 +264,17 @@ cat("Load in another script with:\n")
 cat("  rf_model <- readRDS('classifier.rds')\n")
 cat("  predict(rf_model, new_data = df, type = 'prob')$.pred_Yes\n")
 cat("  predict(rf_model, new_data = df)$.pred_class\n")
+```
+
+```{r rf_importance}
+# Variable importance from the fitted ranger model
+rf_imp <- rf_final_fit %>%
+  extract_fit_engine() %>%
+  `[[`("variable.importance")
+rf_imp <- sort(rf_imp, decreasing = TRUE)
+par(mar = c(10, 4, 4, 2))
+barplot(rf_imp[1:10],las = 2, main = "RF Variable Importance (top 10)", cex.names = 0.7)
+par(mar = c(5, 4, 4, 2))
 ```
 
 ---
@@ -311,6 +332,22 @@ xgb_final_fit   <- fit(xgb_final_wf, data = train_val)
 xgb_prob_test  <- predict(xgb_final_fit, new_data = test, type = "prob")$.pred_Yes
 xgb_class_test <- predict(xgb_final_fit, new_data = test)$.pred_class
 xgb_res <- evaluate(y_test, xgb_class_test, xgb_prob_test, "XGBoost (test)")
+```
+
+```{r xgb_importance}
+# Variable importance from the fitted xgboost model
+xgb_imp <- xgb_final_fit %>%
+  extract_fit_engine() %>%
+  xgb.importance(model = .)
+
+par(mar = c(10, 4, 4, 2))
+barplot(
+  setNames(xgb_imp$Gain[1:10], xgb_imp$Feature[1:10]),
+  las = 2, main = "XGBoost Variable Importance – Gain (top 10)", cex.names = 0.7
+)
+par(mar = c(5, 4, 4, 2))
+
+print(xgb_imp)
 ```
 
 ---
